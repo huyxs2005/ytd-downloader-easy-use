@@ -614,6 +614,23 @@ function Add-LogRecord {
     }) | Out-Null
 }
 
+function Test-EligibleForManualReview {
+    param(
+        [Parameter(Mandatory = $true)] $Item,
+        [Parameter(Mandatory = $true)][ValidateSet('Audio', 'Video')] [string] $Mode
+    )
+
+    if ($Mode -ne 'Audio') {
+        return $false
+    }
+
+    if (Test-UnavailableVideoPlaceholder -Item $Item) {
+        return $false
+    }
+
+    return ((Get-MusicalVerdict -Item $Item) -eq 'Reject')
+}
+
 function Get-PlaylistDownloadBuckets {
     param(
         [Parameter(Mandatory = $true)] $Items,
@@ -624,7 +641,7 @@ function Get-PlaylistDownloadBuckets {
     $reviewItems = @()
 
     foreach ($item in $Items) {
-        if ($Mode -eq 'Audio' -and (Get-MusicalVerdict -Item $item) -eq 'Reject') {
+        if (Test-EligibleForManualReview -Item $item -Mode $Mode) {
             $reviewItems += $item
             continue
         }
@@ -635,6 +652,57 @@ function Get-PlaylistDownloadBuckets {
     return [pscustomobject]@{
         DownloadItems = @($downloadItems)
         ReviewItems   = @($reviewItems)
+    }
+}
+
+function Get-ManualReviewDisplayInfo {
+    param([Parameter(Mandatory = $true)] $Item)
+
+    $seed = Get-SearchSeedMetadata -Item $Item
+    $reason = if (Test-UnavailableVideoPlaceholder -Item $Item) {
+        'Unavailable'
+    } else {
+        'Not music-like'
+    }
+
+    $displayTitle = [string]$seed.Title
+    if ([string]::IsNullOrWhiteSpace($displayTitle)) {
+        $displayTitle = [string]$Item.title
+    }
+    if ([string]::IsNullOrWhiteSpace($displayTitle)) {
+        $displayTitle = 'untitled'
+    }
+
+    $displayCreator = [string]$seed.Uploader
+    if ([string]::IsNullOrWhiteSpace($displayCreator)) {
+        $displayCreator = 'Unknown'
+    }
+
+    $playlistIndex = ''
+    if ($Item.PSObject.Properties.Match('playlist_index').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$Item.playlist_index)) {
+        try {
+            $playlistIndex = ('{0:0000}' -f [int]$Item.playlist_index)
+        } catch {
+            $playlistIndex = [string]$Item.playlist_index
+        }
+    }
+
+    return [pscustomobject]@{
+        PlaylistIndex = $playlistIndex
+        Title         = $displayTitle
+        Creator       = $displayCreator
+        Reason        = $reason
+        DetailText    = @(
+            ('Title: ' + $displayTitle),
+            ('Creator: ' + $displayCreator),
+            ('Reason: ' + $reason),
+            ('Original title: ' + ([string]$Item.title)),
+            ('Track: ' + ([string]$Item.track)),
+            ('Artist: ' + ([string]$Item.artist)),
+            ('Channel: ' + ([string]$Item.channel)),
+            ('Uploader: ' + ([string]$Item.uploader)),
+            ('Video ID: ' + ([string]$Item.id))
+        ) -join [Environment]::NewLine
     }
 }
 
@@ -681,56 +749,148 @@ function Select-SkippedPlaylistItems {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = if ([string]::IsNullOrWhiteSpace($SourceLabel)) { 'Keep skipped items' } else { 'Keep skipped items - ' + $SourceLabel }
     $form.StartPosition = 'CenterScreen'
-    $form.Width = 860
-    $form.Height = 560
+    $form.Width = 1180
+    $form.Height = 760
     $form.MinimizeBox = $false
-    $form.MaximizeBox = $false
+    $form.MaximizeBox = $true
     $form.TopMost = $true
+    $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $form.KeyPreview = $true
 
     $layout = New-Object System.Windows.Forms.TableLayoutPanel
     $layout.Dock = 'Fill'
     $layout.ColumnCount = 1
-    $layout.RowCount = 3
+    $layout.RowCount = 4
     $layout.Padding = New-Object System.Windows.Forms.Padding(12)
+    $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) | Out-Null
     $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) | Out-Null
     $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
     $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) | Out-Null
     $form.Controls.Add($layout)
 
-    $label = New-Object System.Windows.Forms.Label
-    $label.AutoSize = $true
-    $label.Text = 'Check the items you want to keep. Selected items will be downloaded and added back in playlist order.'
-    $label.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
-    $layout.Controls.Add($label, 0, 0)
+    $headerLabel = New-Object System.Windows.Forms.Label
+    $headerLabel.AutoSize = $true
+    $headerLabel.Text = 'Review songs skipped by the music guard. Private, deleted, and not-found items are not shown here.'
+    $headerLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+    $layout.Controls.Add($headerLabel, 0, 0)
 
-    $checkedList = New-Object System.Windows.Forms.CheckedListBox
-    $checkedList.Dock = 'Fill'
-    $checkedList.CheckOnClick = $true
-    $checkedList.HorizontalScrollbar = $true
-    $checkedList.IntegralHeight = $false
-    $checkedList.FormattingEnabled = $true
-    $checkedList.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+    $toolbar = New-Object System.Windows.Forms.TableLayoutPanel
+    $toolbar.Dock = 'Fill'
+    $toolbar.ColumnCount = 4
+    $toolbar.RowCount = 1
+    $toolbar.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+    $toolbar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize))) | Out-Null
+    $toolbar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+    $toolbar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize))) | Out-Null
+    $toolbar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize))) | Out-Null
+    $layout.Controls.Add($toolbar, 0, 1)
 
-    $displayItems = New-Object System.Collections.Generic.List[string]
-    foreach ($item in $Items) {
-        $prefix = ''
-        if ($item.PSObject.Properties.Match('playlist_index').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$item.playlist_index)) {
-            $prefix = ('{0:0000} - ' -f [int]$item.playlist_index)
-        }
-        $displayItems.Add($prefix + [string]$item.title + '  [not music-like]') | Out-Null
-    }
+    $filterLabel = New-Object System.Windows.Forms.Label
+    $filterLabel.AutoSize = $true
+    $filterLabel.Anchor = 'Left'
+    $filterLabel.Text = 'Filter'
+    $filterLabel.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 0)
+    $toolbar.Controls.Add($filterLabel, 0, 0)
 
-    for ($i = 0; $i -lt $displayItems.Count; $i++) {
-        [void]$checkedList.Items.Add($displayItems[$i], $false)
-    }
-    $layout.Controls.Add($checkedList, 0, 1)
+    $filterTextBox = New-Object System.Windows.Forms.TextBox
+    $filterTextBox.Dock = 'Fill'
+    $filterTextBox.Margin = New-Object System.Windows.Forms.Padding(0, 0, 12, 0)
+    $toolbar.Controls.Add($filterTextBox, 1, 0)
+
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.AutoSize = $true
+    $statusLabel.Anchor = 'Right'
+    $statusLabel.Margin = New-Object System.Windows.Forms.Padding(0, 6, 12, 0)
+    $toolbar.Controls.Add($statusLabel, 2, 0)
+
+    $helpLabel = New-Object System.Windows.Forms.Label
+    $helpLabel.AutoSize = $true
+    $helpLabel.Anchor = 'Right'
+    $helpLabel.Text = 'Use the checkbox column to keep songs'
+    $helpLabel.Margin = New-Object System.Windows.Forms.Padding(0, 6, 0, 0)
+    $toolbar.Controls.Add($helpLabel, 3, 0)
+
+    $splitContainer = New-Object System.Windows.Forms.SplitContainer
+    $splitContainer.Dock = 'Fill'
+    $splitContainer.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+    $splitContainer.SplitterDistance = 470
+    $splitContainer.Panel1MinSize = 320
+    $splitContainer.Panel2MinSize = 140
+    $layout.Controls.Add($splitContainer, 0, 2)
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Dock = 'Fill'
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.MultiSelect = $true
+    $grid.SelectionMode = 'FullRowSelect'
+    $grid.AutoGenerateColumns = $false
+    $grid.RowHeadersVisible = $false
+    $grid.BackgroundColor = [System.Drawing.Color]::White
+    $grid.BorderStyle = 'FixedSingle'
+    $grid.EditMode = 'EditOnEnter'
+    $grid.AutoSizeRowsMode = 'None'
+    $grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+    $grid.DefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $splitContainer.Panel1.Controls.Add($grid)
+
+    $keepColumn = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+    $keepColumn.Name = 'Keep'
+    $keepColumn.HeaderText = 'Keep'
+    $keepColumn.Width = 52
+    $keepColumn.SortMode = 'NotSortable'
+    [void]$grid.Columns.Add($keepColumn)
+
+    $indexColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $indexColumn.Name = 'PlaylistIndex'
+    $indexColumn.HeaderText = '#'
+    $indexColumn.Width = 70
+    $indexColumn.ReadOnly = $true
+    $indexColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+    [void]$grid.Columns.Add($indexColumn)
+
+    $titleColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $titleColumn.Name = 'Title'
+    $titleColumn.HeaderText = 'Title'
+    $titleColumn.AutoSizeMode = 'Fill'
+    $titleColumn.FillWeight = 52
+    $titleColumn.ReadOnly = $true
+    $titleColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+    [void]$grid.Columns.Add($titleColumn)
+
+    $creatorColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $creatorColumn.Name = 'Creator'
+    $creatorColumn.HeaderText = 'Artist / Channel'
+    $creatorColumn.AutoSizeMode = 'Fill'
+    $creatorColumn.FillWeight = 26
+    $creatorColumn.ReadOnly = $true
+    $creatorColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+    [void]$grid.Columns.Add($creatorColumn)
+
+    $reasonColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $reasonColumn.Name = 'Reason'
+    $reasonColumn.HeaderText = 'Reason'
+    $reasonColumn.Width = 130
+    $reasonColumn.ReadOnly = $true
+    $reasonColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+    [void]$grid.Columns.Add($reasonColumn)
+
+    $detailBox = New-Object System.Windows.Forms.TextBox
+    $detailBox.Dock = 'Fill'
+    $detailBox.Multiline = $true
+    $detailBox.ReadOnly = $true
+    $detailBox.ScrollBars = 'Vertical'
+    $detailBox.BackColor = [System.Drawing.Color]::White
+    $detailBox.Font = New-Object System.Drawing.Font('Consolas', 10)
+    $splitContainer.Panel2.Controls.Add($detailBox)
 
     $buttonRow = New-Object System.Windows.Forms.FlowLayoutPanel
     $buttonRow.Dock = 'Fill'
     $buttonRow.FlowDirection = 'RightToLeft'
     $buttonRow.WrapContents = $false
     $buttonRow.AutoSize = $true
-    $layout.Controls.Add($buttonRow, 0, 2)
+    $layout.Controls.Add($buttonRow, 0, 3)
 
     $okButton = New-Object System.Windows.Forms.Button
     $okButton.Text = 'Keep Selected'
@@ -749,36 +909,165 @@ function Select-SkippedPlaylistItems {
     $selectNoneButton.AutoSize = $true
     $buttonRow.Controls.Add($selectNoneButton)
 
-    $selectAllButton = New-Object System.Windows.Forms.Button
-    $selectAllButton.Text = 'Select All'
-    $selectAllButton.AutoSize = $true
-    $buttonRow.Controls.Add($selectAllButton)
+    $selectVisibleButton = New-Object System.Windows.Forms.Button
+    $selectVisibleButton.Text = 'Select Visible'
+    $selectVisibleButton.AutoSize = $true
+    $buttonRow.Controls.Add($selectVisibleButton)
+
+    $clearVisibleButton = New-Object System.Windows.Forms.Button
+    $clearVisibleButton.Text = 'Clear Visible'
+    $clearVisibleButton.AutoSize = $true
+    $buttonRow.Controls.Add($clearVisibleButton)
 
     $keepAllButton = New-Object System.Windows.Forms.Button
     $keepAllButton.Text = 'Keep All Skipped Items'
     $keepAllButton.AutoSize = $true
     $buttonRow.Controls.Add($keepAllButton)
 
-    $selectAllButton.Add_Click({
-        for ($i = 0; $i -lt $checkedList.Items.Count; $i++) {
-            $checkedList.SetItemChecked($i, $true)
+    $rowRecords = New-Object System.Collections.Generic.List[object]
+    foreach ($item in $Items) {
+        $display = Get-ManualReviewDisplayInfo -Item $item
+        $rowIndex = $grid.Rows.Add($false, $display.PlaylistIndex, $display.Title, $display.Creator, $display.Reason)
+        $row = $grid.Rows[$rowIndex]
+        $row.Tag = [pscustomobject]@{
+            Item       = $item
+            SearchText = ((@($display.PlaylistIndex, $display.Title, $display.Creator, $display.Reason) -join ' ').ToLowerInvariant())
+            DetailText = $display.DetailText
+        }
+        switch ($display.Reason) {
+            'Not music-like' {
+                $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 249, 230)
+                $row.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(244, 214, 120)
+            }
+            'Unavailable' {
+                $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(245, 235, 235)
+                $row.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(224, 170, 170)
+            }
+        }
+        $rowRecords.Add($row) | Out-Null
+    }
+
+    $refreshStatus = {
+        $selectedCount = 0
+        $visibleCount = 0
+        foreach ($row in $grid.Rows) {
+            if (-not $row.Visible) {
+                continue
+            }
+            $visibleCount++
+            if ([bool]$row.Cells['Keep'].Value) {
+                $selectedCount++
+            }
+        }
+        $statusLabel.Text = ('{0} selected, {1} visible, {2} total' -f $selectedCount, $visibleCount, $Items.Count)
+    }
+
+    $applyFilter = {
+        $needle = $filterTextBox.Text.Trim().ToLowerInvariant()
+        foreach ($row in $grid.Rows) {
+            $record = $row.Tag
+            $row.Visible = ([string]::IsNullOrWhiteSpace($needle) -or $record.SearchText.Contains($needle))
+        }
+
+        foreach ($row in $grid.Rows) {
+            if ($row.Visible) {
+                $row.Selected = $true
+                $grid.CurrentCell = $row.Cells['Title']
+                $detailBox.Text = $row.Tag.DetailText
+                break
+            }
+        }
+
+        & $refreshStatus
+    }
+
+    $updateDetailPane = {
+        if ($grid.SelectedRows.Count -gt 0) {
+            $detailBox.Text = [string]$grid.SelectedRows[0].Tag.DetailText
+        } elseif ($grid.CurrentRow -and $grid.CurrentRow.Visible) {
+            $detailBox.Text = [string]$grid.CurrentRow.Tag.DetailText
+        } else {
+            $detailBox.Text = ''
+        }
+    }
+
+    $setVisibleSelection = {
+        param([bool] $isChecked)
+
+        foreach ($row in $grid.Rows) {
+            if ($row.Visible) {
+                $row.Cells['Keep'].Value = $isChecked
+            }
+        }
+        & $refreshStatus
+    }
+
+    $filterTextBox.Add_TextChanged({ & $applyFilter })
+    $grid.Add_SelectionChanged({ & $updateDetailPane })
+    $grid.Add_CurrentCellDirtyStateChanged({
+        if ($grid.IsCurrentCellDirty) {
+            $grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
+        }
+    })
+    $grid.Add_CellValueChanged({
+        if ($_.ColumnIndex -ge 0 -and $grid.Columns[$_.ColumnIndex].Name -eq 'Keep') {
+            & $refreshStatus
+        }
+    })
+    $grid.Add_CellDoubleClick({
+        if ($_.RowIndex -lt 0) {
+            return
+        }
+        $row = $grid.Rows[$_.RowIndex]
+        $current = [bool]$row.Cells['Keep'].Value
+        $row.Cells['Keep'].Value = (-not $current)
+        & $refreshStatus
+    })
+    $grid.Add_KeyDown({
+        if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Space -and $grid.CurrentRow) {
+            $row = $grid.CurrentRow
+            $current = [bool]$row.Cells['Keep'].Value
+            $row.Cells['Keep'].Value = (-not $current)
+            $_.Handled = $true
+            & $refreshStatus
+            return
         }
     })
 
-    $keepAllButton.Add_Click({
-        for ($i = 0; $i -lt $checkedList.Items.Count; $i++) {
-            $checkedList.SetItemChecked($i, $true)
+    $form.Add_KeyDown({
+        if ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::A) {
+            & $setVisibleSelection $true
+            $_.Handled = $true
+            return
+        }
+        if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Oem2 -or $_.KeyCode -eq [System.Windows.Forms.Keys]::Divide) {
+            $filterTextBox.Focus()
+            $filterTextBox.SelectAll()
+            $_.Handled = $true
+            return
         }
     })
 
+    $selectVisibleButton.Add_Click({ & $setVisibleSelection $true })
+    $clearVisibleButton.Add_Click({ & $setVisibleSelection $false })
     $selectNoneButton.Add_Click({
-        for ($i = 0; $i -lt $checkedList.Items.Count; $i++) {
-            $checkedList.SetItemChecked($i, $false)
+        foreach ($row in $grid.Rows) {
+            $row.Cells['Keep'].Value = $false
         }
+        & $refreshStatus
+    })
+    $keepAllButton.Add_Click({
+        foreach ($row in $grid.Rows) {
+            $row.Cells['Keep'].Value = $true
+        }
+        & $refreshStatus
     })
 
     $form.AcceptButton = $okButton
     $form.CancelButton = $cancelButton
+
+    & $applyFilter
+    & $updateDetailPane
 
     $result = $form.ShowDialog()
     if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
@@ -786,10 +1075,9 @@ function Select-SkippedPlaylistItems {
     }
 
     $selected = New-Object System.Collections.Generic.List[object]
-    for ($i = 0; $i -lt $checkedList.CheckedIndices.Count; $i++) {
-        $index = [int]$checkedList.CheckedIndices[$i]
-        if ($index -ge 0 -and $index -lt $Items.Count) {
-            $selected.Add($Items[$index]) | Out-Null
+    foreach ($row in $grid.Rows) {
+        if ([bool]$row.Cells['Keep'].Value) {
+            $selected.Add($row.Tag.Item) | Out-Null
         }
     }
 
@@ -836,6 +1124,121 @@ function Get-ItemDisplayLabel {
     }
 
     return $title
+}
+
+function Get-PreferredFinalTitle {
+    param(
+        [Parameter(Mandatory = $true)] $Item,
+        [string] $InfoPath
+    )
+
+    $itemTitle = [string]$Item.title
+    if (-not [string]::IsNullOrWhiteSpace($InfoPath) -and (Test-Path -LiteralPath $InfoPath)) {
+        try {
+            $info = Get-Content -LiteralPath $InfoPath -Raw | ConvertFrom-Json
+            $infoTitle = [string]$info.title
+            if (-not [string]::IsNullOrWhiteSpace($infoTitle)) {
+                if ((Test-UnavailableVideoPlaceholder -Item $Item) -or [string]::IsNullOrWhiteSpace($itemTitle)) {
+                    return $infoTitle
+                }
+            }
+        } catch {
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($itemTitle)) {
+        return $itemTitle
+    }
+
+    return 'untitled'
+}
+
+function Get-WorkerWindowBounds {
+    param(
+        [Parameter(Mandatory = $true)][int] $WorkerSlot,
+        [int] $Margin = 8
+    )
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    } catch {
+        return $null
+    }
+
+    $slot = $WorkerSlot
+    if ($slot -lt 1 -or $slot -gt 4) {
+        $slot = 1
+    }
+
+    $width = [Math]::Max([int](($area.Width - ($Margin * 3)) / 2), 420)
+    $height = [Math]::Max([int](($area.Height - ($Margin * 3)) / 2), 260)
+
+    $left = $area.Left + $Margin
+    $top = $area.Top + $Margin
+    if ($slot -eq 2 -or $slot -eq 4) {
+        $left = $area.Left + $area.Width - $width - $Margin
+    }
+    if ($slot -eq 3 -or $slot -eq 4) {
+        $top = $area.Top + $area.Height - $height - $Margin
+    }
+
+    return [pscustomobject]@{
+        X      = $left
+        Y      = $top
+        Width  = $width
+        Height = $height
+    }
+}
+
+function Set-ProcessWindowBounds {
+    param(
+        [Parameter(Mandatory = $true)] $Process,
+        [Parameter(Mandatory = $true)][int] $WorkerSlot
+    )
+
+    if ($null -eq $Process) {
+        return
+    }
+
+    $bounds = Get-WorkerWindowBounds -WorkerSlot $WorkerSlot
+    if ($null -eq $bounds) {
+        return
+    }
+
+    try {
+        Add-Type -Namespace Win32 -Name NativeWindow -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool MoveWindow(System.IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+'@ -ErrorAction SilentlyContinue
+    } catch {
+    }
+
+    $handle = [IntPtr]::Zero
+    for ($i = 0; $i -lt 40; $i++) {
+        try {
+            $Process.Refresh()
+        } catch {
+        }
+
+        $handle = $Process.MainWindowHandle
+        if ($handle -and $handle -ne [IntPtr]::Zero) {
+            break
+        }
+        Start-Sleep -Milliseconds 250
+    }
+
+    if (-not $handle -or $handle -eq [IntPtr]::Zero) {
+        return
+    }
+
+    try {
+        [Win32.NativeWindow]::ShowWindow($handle, 9) | Out-Null
+        [Win32.NativeWindow]::MoveWindow($handle, $bounds.X, $bounds.Y, $bounds.Width, $bounds.Height, $true) | Out-Null
+    } catch {
+    }
 }
 
 function Select-UpdateTargetFolder {
@@ -965,7 +1368,11 @@ function Merge-LogFiles {
 }
 
 function Get-SearchUrlsFromMusic {
-    param([Parameter(Mandatory = $true)][string] $Query)
+    param(
+        [Parameter(Mandatory = $true)][string] $Query,
+        [string] $TitleHint,
+        [string] $UploaderHint
+    )
 
     $encoded = [uri]::EscapeDataString($Query)
     $url = "https://music.youtube.com/search?q=$encoded&params=$musicSearchSongsParams&hl=en&gl=US"
@@ -981,14 +1388,35 @@ function Get-SearchUrlsFromMusic {
     }
 
     $urls = New-Object System.Collections.Generic.List[string]
-    $regexMatches = [regex]::Matches($resp.Content, 'videoId\\x22:\\x22(?<id>[A-Za-z0-9_-]{11})')
-    foreach ($match in $regexMatches) {
-        $id = $match.Groups['id'].Value
-        if (-not [string]::IsNullOrWhiteSpace($id)) {
-            $url = "https://music.youtube.com/watch?v=$id"
-            if (-not $urls.Contains($url)) {
-                $urls.Add($url) | Out-Null
+    $seenIds = New-Object System.Collections.Generic.HashSet[string]
+    $patterns = @(
+        'videoId\\x22:\\x22(?<id>[A-Za-z0-9_-]{11})',
+        '"videoId":"(?<id>[A-Za-z0-9_-]{11})"',
+        '"videoId":\s*"(?<id>[A-Za-z0-9_-]{11})"'
+    )
+
+    foreach ($pattern in $patterns) {
+        $regexMatches = [regex]::Matches($resp.Content, $pattern)
+        foreach ($match in $regexMatches) {
+            $id = $match.Groups['id'].Value
+            if (-not [string]::IsNullOrWhiteSpace($id) -and $seenIds.Add($id)) {
+                $candidateUrl = "https://music.youtube.com/watch?v=$id"
+                if (-not $urls.Contains($candidateUrl)) {
+                    $urls.Add($candidateUrl) | Out-Null
+                }
             }
+        }
+    }
+
+    # YouTube Music search is scraped from page HTML and can break at any time.
+    # If it yields nothing or too few candidates, append yt-dlp's native YouTube search results.
+    $youtubeFallbackUrls = @(Get-SearchUrlsFromYouTube -Query $Query -TitleHint $TitleHint -UploaderHint $UploaderHint)
+    foreach ($fallbackUrl in $youtubeFallbackUrls) {
+        if ([string]::IsNullOrWhiteSpace($fallbackUrl)) {
+            continue
+        }
+        if (-not $urls.Contains($fallbackUrl)) {
+            $urls.Add($fallbackUrl) | Out-Null
         }
     }
 
@@ -1160,6 +1588,44 @@ function Get-ExistingNumberedFiles {
         Sort-Object { [int]($_.BaseName.Substring(0, 4)) }, BaseName
 }
 
+function Get-SearchSeedMetadata {
+    param([Parameter(Mandatory = $true)] $Item)
+
+    $placeholderPattern = '(?i)^\s*\[?(private video|video unavailable|deleted video|removed video|this video is unavailable)\]?\s*$'
+
+    $preferredTitle = $null
+    foreach ($candidate in @([string]$Item.track, [string]$Item.title, [string]$Item.alt_title, [string]$Item.fulltitle)) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+        if ($candidate -match $placeholderPattern) {
+            continue
+        }
+        $preferredTitle = $candidate.Trim()
+        break
+    }
+
+    $preferredUploader = $null
+    foreach ($candidate in @([string]$Item.artist, [string]$Item.channel, [string]$Item.uploader)) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+        if ($candidate -match $placeholderPattern) {
+            continue
+        }
+        $preferredUploader = $candidate.Trim()
+        break
+    }
+
+    return [pscustomobject]@{
+        Title                 = $preferredTitle
+        Uploader              = $preferredUploader
+        Track                 = [string]$Item.track
+        Artist                = [string]$Item.artist
+        HasSearchableMetadata = (-not [string]::IsNullOrWhiteSpace($preferredTitle))
+    }
+}
+
 function Select-DownloadAttemptSequence {
     param(
         [Parameter(Mandatory = $true)] $Item,
@@ -1175,23 +1641,21 @@ function Select-DownloadAttemptSequence {
         $watchUrl = 'https://www.youtube.com/watch?v=' + $Item.id
     }
     $musicWatchUrl = 'https://music.youtube.com/watch?v=' + $Item.id
-    $title = [string]$Item.title
-    $uploader = [string]$Item.channel
-    if ([string]::IsNullOrWhiteSpace($uploader)) {
-        $uploader = [string]$Item.uploader
-    }
-    $track = [string]$Item.track
-    $artist = [string]$Item.artist
+    $searchSeed = Get-SearchSeedMetadata -Item $Item
+    $title = [string]$searchSeed.Title
+    $uploader = [string]$searchSeed.Uploader
+    $track = [string]$searchSeed.Track
+    $artist = [string]$searchSeed.Artist
     $attempts = New-Object System.Collections.Generic.List[object]
 
     if ($Mode -eq 'Audio') {
         $musicQueries = New-Object System.Collections.Generic.List[string]
         foreach ($query in @(
-            @($title, $uploader) -join ' ',
-            @($title, $artist) -join ' ',
-            @($track, $artist) -join ' ',
-            @($title, 'Topic') -join ' ',
-            @($title, $uploader, 'Topic') -join ' ',
+            (@($title, $uploader) -join ' '),
+            (@($title, $artist) -join ' '),
+            (@($track, $artist) -join ' '),
+            (@($title, 'Topic') -join ' '),
+            (@($title, $uploader, 'Topic') -join ' '),
             $title
         )) {
             if (-not [string]::IsNullOrWhiteSpace($query) -and -not $musicQueries.Contains($query)) {
@@ -1201,11 +1665,11 @@ function Select-DownloadAttemptSequence {
 
         $youtubeQueries = New-Object System.Collections.Generic.List[string]
         foreach ($query in @(
-            @($title, $uploader) -join ' ',
-            @($title, $artist) -join ' ',
-            @($track, $artist) -join ' ',
-            @($title, 'Topic') -join ' ',
-            @($title, $uploader, 'Topic') -join ' ',
+            (@($title, $uploader) -join ' '),
+            (@($title, $artist) -join ' '),
+            (@($track, $artist) -join ' '),
+            (@($title, 'Topic') -join ' '),
+            (@($title, $uploader, 'Topic') -join ' '),
             $title
         )) {
             if (-not [string]::IsNullOrWhiteSpace($query) -and -not $youtubeQueries.Contains($query)) {
@@ -1243,11 +1707,11 @@ function Select-DownloadAttemptSequence {
 
         $youtubeQueries = New-Object System.Collections.Generic.List[string]
         foreach ($query in @(
-            @($title, $uploader) -join ' ',
-            @($title, $artist) -join ' ',
-            @($track, $artist) -join ' ',
-            @($title, 'Topic') -join ' ',
-            @($title, $uploader, 'Topic') -join ' ',
+            (@($title, $uploader) -join ' '),
+            (@($title, $artist) -join ' '),
+            (@($track, $artist) -join ' '),
+            (@($title, 'Topic') -join ' '),
+            (@($title, $uploader, 'Topic') -join ' '),
             $title
         )) {
             if (-not [string]::IsNullOrWhiteSpace($query) -and -not $youtubeQueries.Contains($query)) {
@@ -1277,24 +1741,33 @@ function Invoke-DownloadAttempt {
         [switch] $BypassGuard
     )
 
-    if (Test-UnavailableVideoPlaceholder -Item $Item) {
-        return [pscustomobject]@{
-            Success      = $false
-            FilteredOut  = $true
-            UsedFallback = $false
-            AttemptLabel = 'private or unavailable video'
-            MediaPath    = $null
-            InfoPath     = $null
-            IdPath       = $null
-            ItemId       = $null
-            Url          = $null
-            AttemptIndex = -1
+    $searchSeed = Get-SearchSeedMetadata -Item $Item
+    $itemUnavailable = Test-UnavailableVideoPlaceholder -Item $Item
+    $attempts = @(Select-DownloadAttemptSequence -Item $Item -Mode $Mode -BypassGuard:$BypassGuard)
+    if ($itemUnavailable) {
+        if (-not $searchSeed.HasSearchableMetadata) {
+            return [pscustomobject]@{
+                Success      = $false
+                FilteredOut  = $false
+                UsedFallback = $false
+                AttemptLabel = 'private or unavailable video with no searchable title/author metadata'
+                MediaPath    = $null
+                InfoPath     = $null
+                IdPath       = $null
+                ItemId       = $null
+                Url          = $null
+                AttemptIndex = -1
+            }
         }
+
+        $attempts = @($attempts | Where-Object { $_.Kind -in @('music-search', 'youtube-search') })
     }
 
-    $attempts = Select-DownloadAttemptSequence -Item $Item -Mode $Mode -BypassGuard:$BypassGuard
     $itemId = [string]$Item.id
-    $title = [string]$Item.title
+    $title = [string]$searchSeed.Title
+    if ([string]::IsNullOrWhiteSpace($title)) {
+        $title = [string]$Item.title
+    }
     if ([string]::IsNullOrWhiteSpace($title)) {
         $title = 'untitled'
     }
@@ -1306,12 +1779,12 @@ function Invoke-DownloadAttempt {
         switch ($attempt.Kind) {
             'direct-music' { $resolvedUrls = @($attempt.Url) }
             'direct-youtube' { $resolvedUrls = @($attempt.Url) }
-            'music-search' { $resolvedUrls = @(Get-SearchUrlsFromMusic -Query $attempt.Query) }
+            'music-search' {
+                $hintUploader = [string]$searchSeed.Uploader
+                $resolvedUrls = @(Get-SearchUrlsFromMusic -Query $attempt.Query -TitleHint $title -UploaderHint $hintUploader)
+            }
             'youtube-search' {
-                $hintUploader = [string]$Item.channel
-                if ([string]::IsNullOrWhiteSpace($hintUploader)) {
-                    $hintUploader = [string]$Item.uploader
-                }
+                $hintUploader = [string]$searchSeed.Uploader
                 $resolvedUrls = @(Get-SearchUrlsFromYouTube -Query $attempt.Query -TitleHint $title -UploaderHint $hintUploader)
             }
         }
@@ -1576,33 +2049,31 @@ function Start-WorkerProcess {
         [Parameter(Mandatory = $true)][ValidateSet('Create', 'Update')] [string] $RunKind,
         [Parameter(Mandatory = $true)][ValidateSet('Audio', 'Video')] [string] $Mode,
         [Parameter(Mandatory = $true)][string] $SourceLabel,
-        [string] $WorkerLabel
+        [string] $WorkerLabel,
+        [int] $WorkerSlot = 0
     )
 
-    $argumentList = @(
-        '-NoProfile'
-        '-ExecutionPolicy Bypass'
-        ('-File "' + $script:LauncherScriptPath + '"')
-        '-Worker'
-        ('-JobFile "' + $JobFile + '"')
-        ('-TempRoot "' + $TempRoot + '"')
-        ('-TargetFolder "' + $TargetFolder + '"')
-        ('-WorkerLogFile "' + $WorkerLogFile + '"')
-        ('-RunKind ' + $RunKind)
-        ('-Mode ' + $Mode)
-        ('-SourceLabel "' + $SourceLabel + '"')
-        ('-WorkerLabel "' + $WorkerLabel + '"')
-    ) -join ' '
+    $arguments = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $script:LauncherScriptPath,
+        '-Worker',
+        '-JobFile', $JobFile,
+        '-TempRoot', $TempRoot,
+        '-TargetFolder', $TargetFolder,
+        '-WorkerLogFile', $WorkerLogFile,
+        '-RunKind', $RunKind,
+        '-Mode', $Mode,
+        '-SourceLabel', $SourceLabel,
+        '-WorkerLabel', $WorkerLabel
+    )
 
-    $workerCommand = @(
-        'start'
-        '""'
-        '/wait'
-        'powershell.exe'
-        $argumentList
-    ) -join ' '
+    $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -WorkingDirectory $PSScriptRoot -PassThru -WindowStyle Normal
+    if ($WorkerSlot -gt 0) {
+        Set-ProcessWindowBounds -Process $process -WorkerSlot $WorkerSlot
+    }
 
-    return Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c ' + $workerCommand) -WorkingDirectory $PSScriptRoot -PassThru -WindowStyle Normal
+    return $process
 }
 
 function Remove-StaleNumberedFiles {
@@ -1737,7 +2208,7 @@ function Invoke-CreateSingle {
         [Parameter(Mandatory = $true)][ValidateSet('Audio', 'Video')] [string] $Mode
     )
 
-    if ($Mode -eq 'Audio' -and (Get-MusicalVerdict -Item $Item) -eq 'Reject') {
+    if (Test-EligibleForManualReview -Item $Item -Mode $Mode) {
         Add-LogRecord -Section 'Skipped By Filter' -Message ($Item.title + ' - not music-like')
         return
     }
@@ -1758,7 +2229,7 @@ function Invoke-CreateSingle {
             return
         }
 
-        $safeTitle = Get-SafeFileName -Name $Item.title
+        $safeTitle = Get-SafeFileName -Name (Get-PreferredFinalTitle -Item $Item -InfoPath $download.InfoPath)
         $finalPath = Move-StagedPairToFinal -SourceMedia $download.MediaPath -SourceInfo $download.InfoPath -SourceId $download.IdPath -FinalMediaBase $safeTitle -TargetFolder $TargetFolder -AllowUniqueSuffix -ItemId $download.ItemId
         if ($download.UsedFallback) {
             Add-LogRecord -Section 'Fallback Success' -Message ($Item.title + ' -> ' + (Split-Path -Leaf $finalPath))
@@ -1824,7 +2295,7 @@ function Invoke-CreatePlaylist {
             $slice | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jobFile -Encoding UTF8
 
             $workerLabel = 'Worker {0}/4' -f ($workerIndex + 1)
-            $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $PlaylistFolder -WorkerLogFile $workerLog -RunKind Create -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel $workerLabel
+            $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $PlaylistFolder -WorkerLogFile $workerLog -RunKind Create -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel $workerLabel -WorkerSlot ($workerIndex + 1)
             $workerInfos.Add([pscustomobject]@{
                 Process = $process
                 LogFile = $workerLog
@@ -1867,7 +2338,7 @@ function Invoke-CreatePlaylist {
     $downloadedById = Get-StagedMediaMap -StageRoot $workerRoot
     $finalIndex = 1
     foreach ($item in $Items) {
-        if ($Mode -eq 'Audio' -and (Get-MusicalVerdict -Item $item) -eq 'Reject' -and -not $selectedReviewIds.Contains([string]$item.id)) {
+        if ((Test-EligibleForManualReview -Item $item -Mode $Mode) -and -not $selectedReviewIds.Contains([string]$item.id)) {
             continue
         }
         if (-not $downloadedById.ContainsKey([string]$item.id)) {
@@ -1876,7 +2347,7 @@ function Invoke-CreatePlaylist {
 
         $staged = Get-Item -LiteralPath $downloadedById[$item.id]
         $stagedInfo = [System.IO.Path]::ChangeExtension($staged.FullName, '.info.json')
-        $finalBase = ('{0:0000} - {1}' -f $finalIndex, (Get-SafeFileName -Name $item.title))
+        $finalBase = ('{0:0000} - {1}' -f $finalIndex, (Get-SafeFileName -Name (Get-PreferredFinalTitle -Item $item -InfoPath $stagedInfo)))
         if (-not (Test-Path -LiteralPath $stagedInfo)) {
             $stagedInfo = $null
         }
@@ -1900,7 +2371,7 @@ function Invoke-UpdateSingle {
         [Parameter(Mandatory = $true)][ValidateSet('Audio', 'Video')] [string] $Mode
     )
 
-    if ($Mode -eq 'Audio' -and (Get-MusicalVerdict -Item $Item) -eq 'Reject') {
+    if (Test-EligibleForManualReview -Item $Item -Mode $Mode) {
         Add-LogRecord -Section 'Skipped By Filter' -Message ($Item.title + ' - not music-like')
         return
     }
@@ -1927,7 +2398,22 @@ function Invoke-UpdateSingle {
         }
 
         $existingCatalog = Get-ExistingCatalog -Folder $TargetFolder
-        $numbered = @($existingCatalog | Where-Object { $_.IsNumbered } | Sort-Object Index, BaseName)
+        $existingOrdered = @(
+            $existingCatalog |
+                Sort-Object @{
+                    Expression = {
+                        if ($null -ne $_.Index) { 0 } else { 1 }
+                    }
+                }, @{
+                    Expression = {
+                        if ($null -ne $_.Index) { [int]$_.Index } else { [int]::MaxValue }
+                    }
+                }, @{
+                    Expression = {
+                        if (-not [string]::IsNullOrWhiteSpace([string]$_.Title)) { [string]$_.Title } else { [string]$_.BaseName }
+                    }
+                }
+        )
 
         $finalItems = New-Object System.Collections.Generic.List[object]
         $finalItems.Add([pscustomobject]@{
@@ -1936,15 +2422,15 @@ function Invoke-UpdateSingle {
             SourceInfo = $download.InfoPath
             SourceId = $download.IdPath
             ItemId = $Item.id
-            FinalBase = ('0001 - ' + (Get-SafeFileName -Name $Item.title))
+            FinalBase = ('0001 - ' + (Get-SafeFileName -Name (Get-PreferredFinalTitle -Item $Item -InfoPath $download.InfoPath)))
         }) | Out-Null
 
         $index = 2
-        foreach ($entry in $numbered) {
+        foreach ($entry in $existingOrdered) {
             $media = $entry.MediaPath
             $info = $entry.InfoPath
-            $baseName = $entry.BaseName
-            $base = ('{0:0000} - {1}' -f $index, (Get-SafeFileName -Name $baseName.Substring(7)))
+            $entryTitle = Get-PreferredFinalTitle -Item $entry -InfoPath $info
+            $base = ('{0:0000} - {1}' -f $index, (Get-SafeFileName -Name $entryTitle))
             $entryId = $entry.Id
             $finalItems.Add([pscustomobject]@{
                 Item = $entry
@@ -1995,7 +2481,7 @@ function Invoke-UpdatePlaylist {
     $reviewItems = New-Object System.Collections.Generic.List[object]
 
     foreach ($item in $Items) {
-        if ($Mode -eq 'Audio' -and (Get-MusicalVerdict -Item $item) -eq 'Reject') {
+        if (Test-EligibleForManualReview -Item $item -Mode $Mode) {
             Add-LogRecord -Section 'Skipped By Filter' -Message ($item.title + ' - not music-like')
             $reviewItems.Add($item) | Out-Null
             continue
@@ -2040,7 +2526,7 @@ function Invoke-UpdatePlaylist {
             $slice | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jobFile -Encoding UTF8
 
             $workerLabel = 'Worker {0}/4' -f ($workerIndex + 1)
-            $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $TargetFolder -WorkerLogFile $workerLog -RunKind Update -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel $workerLabel
+            $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $TargetFolder -WorkerLogFile $workerLog -RunKind Update -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel $workerLabel -WorkerSlot ($workerIndex + 1)
             $workerInfos.Add([pscustomobject]@{
                 Process = $process
                 LogFile = $workerLog
@@ -2088,7 +2574,7 @@ function Invoke-UpdatePlaylist {
 
     $finalItems = New-Object System.Collections.Generic.List[object]
     foreach ($item in $Items) {
-        $isRejected = ($Mode -eq 'Audio' -and (Get-MusicalVerdict -Item $item) -eq 'Reject')
+        $isRejected = (Test-EligibleForManualReview -Item $item -Mode $Mode)
         if ($isRejected -and -not $selectedReviewIds.Contains([string]$item.id)) {
             continue
         }
@@ -2140,7 +2626,7 @@ function Invoke-UpdatePlaylist {
 
     $finalIndex = 1
     foreach ($slot in $finalItems) {
-        $slot.FinalBase = ('{0:0000} - {1}' -f $finalIndex, (Get-SafeFileName -Name $slot.Item.title))
+        $slot.FinalBase = ('{0:0000} - {1}' -f $finalIndex, (Get-SafeFileName -Name (Get-PreferredFinalTitle -Item $slot.Item -InfoPath $slot.StagedInfo)))
         Move-StagedPairToFinal -SourceMedia $slot.StagedMedia -SourceInfo $slot.StagedInfo -SourceId $slot.StagedId -FinalMediaBase $slot.FinalBase -TargetFolder $TargetFolder -AllowUniqueSuffix -ItemId $slot.ItemId | Out-Null
         $finalIndex++
     }
