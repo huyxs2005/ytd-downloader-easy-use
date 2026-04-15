@@ -672,16 +672,19 @@ function Get-PlaylistDownloadBuckets {
 
 function Get-WorkerFilteredReviewItems {
     param(
-        [Parameter(Mandatory = $true)][string[]] $LogFiles,
-        [Parameter(Mandatory = $true)] [object[]] $CandidateItems
+        [Parameter(Mandatory = $true)] $LogFiles,
+        [Parameter(Mandatory = $true)] $CandidateItems
     )
 
-    if ($LogFiles.Count -eq 0 -or $CandidateItems.Count -eq 0) {
+    $logFileList = @($LogFiles)
+    $candidateItemList = @($CandidateItems)
+
+    if ($logFileList.Count -eq 0 -or $candidateItemList.Count -eq 0) {
         return @()
     }
 
     $itemsById = @{}
-    foreach ($item in $CandidateItems) {
+    foreach ($item in $candidateItemList) {
         $itemId = [string]$item.id
         if ([string]::IsNullOrWhiteSpace($itemId)) {
             continue
@@ -693,7 +696,7 @@ function Get-WorkerFilteredReviewItems {
 
     $selectedIds = New-Object System.Collections.Generic.HashSet[string]
     $selectedItems = New-Object System.Collections.Generic.List[object]
-    foreach ($path in $LogFiles) {
+    foreach ($path in $logFileList) {
         if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
             continue
         }
@@ -722,7 +725,7 @@ function Get-WorkerFilteredReviewItems {
         }
     }
 
-    return @($selectedItems)
+    return $selectedItems.ToArray()
 }
 
 function Get-ManualReviewDisplayInfo {
@@ -821,9 +824,10 @@ function Select-SkippedPlaylistItems {
     $form.StartPosition = 'CenterScreen'
     $form.Width = 1180
     $form.Height = 760
-    $form.MinimizeBox = $false
+    $form.MinimizeBox = $true
     $form.MaximizeBox = $true
-    $form.TopMost = $true
+    $form.ShowInTaskbar = $true
+    $form.TopMost = $false
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $form.KeyPreview = $true
 
@@ -1006,12 +1010,16 @@ function Select-SkippedPlaylistItems {
         }
         switch ($display.Reason) {
             'Not music-like' {
-                $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 249, 230)
-                $row.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(244, 214, 120)
+                $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 248, 220)
+                $row.DefaultCellStyle.ForeColor = [System.Drawing.Color]::FromArgb(34, 34, 34)
+                $row.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(214, 172, 49)
+                $row.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::FromArgb(20, 20, 20)
             }
             'Unavailable' {
                 $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(245, 235, 235)
-                $row.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(224, 170, 170)
+                $row.DefaultCellStyle.ForeColor = [System.Drawing.Color]::FromArgb(34, 34, 34)
+                $row.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(214, 152, 152)
+                $row.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::FromArgb(20, 20, 20)
             }
         }
         $rowRecords.Add($row) | Out-Null
@@ -1131,6 +1139,8 @@ function Select-SkippedPlaylistItems {
             $row.Cells['Keep'].Value = $true
         }
         & $refreshStatus
+        $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $form.Close()
     })
 
     $form.AcceptButton = $okButton
@@ -1151,7 +1161,7 @@ function Select-SkippedPlaylistItems {
         }
     }
 
-    return @($selected)
+    return $selected.ToArray()
 }
 
 function Get-StagedMediaMap {
@@ -1428,6 +1438,36 @@ function Get-ShortDisplayText {
     return ($value.Substring(0, $MaxLength - 3) + '...')
 }
 
+function Convert-SpeedToMegabytesPerSecond {
+    param([string] $SpeedText)
+
+    if ([string]::IsNullOrWhiteSpace($SpeedText)) {
+        return '0.0 MB/s'
+    }
+
+    $text = $SpeedText.Trim()
+    if ($text -match '^(?<value>[0-9]+(?:\.[0-9]+)?)\s*(?<unit>[KMG]i?B)/s$') {
+        $value = [double]$matches['value']
+        $unit = [string]$matches['unit']
+
+        $megabytes = switch ($unit) {
+            'KiB' { ($value * 1024.0) / 1000000.0; break }
+            'MiB' { ($value * 1024.0 * 1024.0) / 1000000.0; break }
+            'GiB' { ($value * 1024.0 * 1024.0 * 1024.0) / 1000000.0; break }
+            'KB'  { $value / 1000.0; break }
+            'MB'  { $value; break }
+            'GB'  { $value * 1000.0; break }
+            default { $null }
+        }
+
+        if ($null -ne $megabytes) {
+            return ('{0:0.0} MB/s' -f $megabytes)
+        }
+    }
+
+    return $text -replace 'MiB/s', 'MB/s' -replace 'KiB/s', 'MB/s'
+}
+
 function Update-WorkerDashboardState {
     param(
         [Parameter(Mandatory = $true)] $WorkerInfo,
@@ -1444,7 +1484,7 @@ function Update-WorkerDashboardState {
         $WorkerInfo.State = 'Downloading'
         $WorkerInfo.CurrentSong = [string]$matches[2]
         $WorkerInfo.TrackPercent = 0.0
-        $WorkerInfo.Speed = '--'
+        $WorkerInfo.Speed = '0.0 MB/s'
         $WorkerInfo.ActiveItem = $true
         return
     }
@@ -1454,7 +1494,7 @@ function Update-WorkerDashboardState {
         $WorkerInfo.State = 'Done'
         $WorkerInfo.CurrentSong = [string]$matches[2]
         $WorkerInfo.TrackPercent = 100.0
-        $WorkerInfo.Speed = '--'
+        $WorkerInfo.Speed = '0.0 MB/s'
         $WorkerInfo.ActiveItem = $false
         return
     }
@@ -1464,7 +1504,7 @@ function Update-WorkerDashboardState {
         $WorkerInfo.State = 'Failed'
         $WorkerInfo.CurrentSong = [string]$matches[2]
         $WorkerInfo.TrackPercent = 0.0
-        $WorkerInfo.Speed = '--'
+        $WorkerInfo.Speed = '0.0 MB/s'
         $WorkerInfo.ActiveItem = $false
         return
     }
@@ -1474,7 +1514,7 @@ function Update-WorkerDashboardState {
         $WorkerInfo.State = 'Skipped'
         $WorkerInfo.CurrentSong = [string]$matches[2]
         $WorkerInfo.TrackPercent = 0.0
-        $WorkerInfo.Speed = '--'
+        $WorkerInfo.Speed = '0.0 MB/s'
         $WorkerInfo.ActiveItem = $false
         return
     }
@@ -1482,20 +1522,20 @@ function Update-WorkerDashboardState {
     if ($text -match '^\[download\]\s+([0-9.]+)% of .* at\s+(.+?) ETA ') {
         $WorkerInfo.State = 'Downloading'
         $WorkerInfo.TrackPercent = [double]$matches[1]
-        $WorkerInfo.Speed = [string]$matches[2].Trim()
+        $WorkerInfo.Speed = Convert-SpeedToMegabytesPerSecond -SpeedText ([string]$matches[2].Trim())
         return
     }
 
     if ($text -match '^\[postprocess\]') {
         $WorkerInfo.State = 'Postprocess'
         $WorkerInfo.TrackPercent = 100.0
-        $WorkerInfo.Speed = '--'
+        $WorkerInfo.Speed = '0.0 MB/s'
         return
     }
 
     if ($text -match '^ERROR:\s+(.+)$') {
         $WorkerInfo.State = 'Error'
-        $WorkerInfo.Speed = '--'
+        $WorkerInfo.Speed = '0.0 MB/s'
         $WorkerInfo.LastMessage = [string]$matches[1]
         return
     }
@@ -1515,7 +1555,7 @@ function Get-WorkerDashboardLine {
 
     $speed = [string]$WorkerInfo.Speed
     if ([string]::IsNullOrWhiteSpace($speed)) {
-        $speed = '--'
+        $speed = '0.0 MB/s'
     }
 
     $trackPercentText = '--'
@@ -2510,6 +2550,37 @@ function Start-WorkerProcess {
     return $process
 }
 
+function New-WorkerRunInfo {
+    param(
+        [Parameter(Mandatory = $true)] $Process,
+        [Parameter(Mandatory = $true)][string] $LogFile,
+        [Parameter(Mandatory = $true)][string] $Label,
+        [Parameter(Mandatory = $true)][string] $StdOutPath,
+        [Parameter(Mandatory = $true)][string] $StdErrPath,
+        [Parameter(Mandatory = $true)][int] $TotalItems
+    )
+
+    return [pscustomobject]@{
+        Process        = $Process
+        LogFile        = $LogFile
+        Label          = $Label
+        TotalItems     = $TotalItems
+        CompletedItems = 0
+        CurrentSong    = ''
+        TrackPercent   = 0.0
+        Speed          = '--'
+        State          = 'Waiting'
+        ActiveItem     = $false
+        LastMessage    = ''
+        StdOutPath     = $StdOutPath
+        StdErrPath     = $StdErrPath
+        StdOutOffset   = 0L
+        StdErrOffset   = 0L
+        StdOutBuffer   = ''
+        StdErrBuffer   = ''
+    }
+}
+
 function Remove-StaleNumberedFiles {
     param([Parameter(Mandatory = $true)][string] $Folder)
 
@@ -2737,25 +2808,7 @@ function Invoke-CreatePlaylist {
 
             $workerLabel = 'Worker {0}/4' -f ($workerIndex + 1)
             $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $PlaylistFolder -WorkerLogFile $workerLog -OutputLogFile $stdoutLog -ErrorLogFile $stderrLog -RunKind Create -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel $workerLabel -WorkerSlot ($workerIndex + 1)
-            $workerInfos.Add([pscustomobject]@{
-                Process      = $process
-                LogFile      = $workerLog
-                Label        = $workerLabel
-                TotalItems   = $slice.Count
-                CompletedItems = 0
-                CurrentSong  = ''
-                TrackPercent = 0.0
-                Speed        = '--'
-                State        = 'Waiting'
-                ActiveItem   = $false
-                LastMessage  = ''
-                StdOutPath   = $stdoutLog
-                StdErrPath   = $stderrLog
-                StdOutOffset = 0L
-                StdErrOffset = 0L
-                StdOutBuffer = ''
-                StdErrBuffer = ''
-            }) | Out-Null
+            $workerInfos.Add((New-WorkerRunInfo -Process $process -LogFile $workerLog -Label $workerLabel -StdOutPath $stdoutLog -StdErrPath $stderrLog -TotalItems $slice.Count)) | Out-Null
         }
 
         Wait-WorkerProcesses -WorkerInfos $workerInfos.ToArray()
@@ -2792,17 +2845,16 @@ function Invoke-CreatePlaylist {
 
         if ($selectedReviewItems.Count -gt 0) {
             Set-ProcessTitle -Title ("yt-dlp | Downloading reviewed items | {0}" -f $labelForWorkers)
-            Write-Host 'Downloading reviewed items...'
-            foreach ($item in $selectedReviewItems) {
-                $reviewStage = Join-Path $workerRoot ('review-' + [Guid]::NewGuid().ToString('N'))
-                New-Item -ItemType Directory -Path $reviewStage | Out-Null
-                $download = Invoke-DownloadAttempt -Item $item -Mode $Mode -StageFolder $reviewStage -BypassGuard
-                if (-not $download.Success) {
-                    Add-LogRecord -Section 'Failed After All Attempts' -Message ($item.title + ' (id: ' + $item.id + ')')
-                } elseif ($download.UsedFallback) {
-                    Add-LogRecord -Section 'Kept After Review' -Message ($item.title + ' -> ' + $download.AttemptLabel)
-                }
-            }
+            $jobFile = Join-Path $workerRoot 'worker-manager.json'
+            $workerLog = Join-Path $workerRoot 'worker-manager.log.json'
+            $stdoutLog = Join-Path $workerRoot 'worker-manager.stdout.log'
+            $stderrLog = Join-Path $workerRoot 'worker-manager.stderr.log'
+            $selectedReviewItems | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jobFile -Encoding UTF8
+
+            $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $PlaylistFolder -WorkerLogFile $workerLog -OutputLogFile $stdoutLog -ErrorLogFile $stderrLog -RunKind Create -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel 'Worker Manager'
+            $managerInfo = New-WorkerRunInfo -Process $process -LogFile $workerLog -Label 'Worker Manager' -StdOutPath $stdoutLog -StdErrPath $stderrLog -TotalItems $selectedReviewItems.Count
+            $workerInfos.Add($managerInfo) | Out-Null
+            Wait-WorkerProcesses -WorkerInfos @($managerInfo)
         }
     }
 
@@ -3001,25 +3053,7 @@ function Invoke-UpdatePlaylist {
 
             $workerLabel = 'Worker {0}/4' -f ($workerIndex + 1)
             $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $TargetFolder -WorkerLogFile $workerLog -OutputLogFile $stdoutLog -ErrorLogFile $stderrLog -RunKind Update -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel $workerLabel -WorkerSlot ($workerIndex + 1)
-            $workerInfos.Add([pscustomobject]@{
-                Process      = $process
-                LogFile      = $workerLog
-                Label        = $workerLabel
-                TotalItems   = $slice.Count
-                CompletedItems = 0
-                CurrentSong  = ''
-                TrackPercent = 0.0
-                Speed        = '--'
-                State        = 'Waiting'
-                ActiveItem   = $false
-                LastMessage  = ''
-                StdOutPath   = $stdoutLog
-                StdErrPath   = $stderrLog
-                StdOutOffset = 0L
-                StdErrOffset = 0L
-                StdOutBuffer = ''
-                StdErrBuffer = ''
-            }) | Out-Null
+            $workerInfos.Add((New-WorkerRunInfo -Process $process -LogFile $workerLog -Label $workerLabel -StdOutPath $stdoutLog -StdErrPath $stderrLog -TotalItems $slice.Count)) | Out-Null
         }
 
         Wait-WorkerProcesses -WorkerInfos $workerInfos.ToArray()
@@ -3056,20 +3090,18 @@ function Invoke-UpdatePlaylist {
 
         if ($selectedReviewItems.Count -gt 0) {
             Set-ProcessTitle -Title ("yt-dlp | Downloading reviewed items | {0}" -f $labelForWorkers)
-            Write-Host 'Downloading reviewed items...'
-            foreach ($item in $selectedReviewItems) {
-                if ($existingById.ContainsKey($item.id)) {
-                    continue
-                }
+            $reviewDownloadItems = @($selectedReviewItems | Where-Object { -not $existingById.ContainsKey($_.id) })
+            if ($reviewDownloadItems.Count -gt 0) {
+                $jobFile = Join-Path $workerRoot 'worker-manager.json'
+                $workerLog = Join-Path $workerRoot 'worker-manager.log.json'
+                $stdoutLog = Join-Path $workerRoot 'worker-manager.stdout.log'
+                $stderrLog = Join-Path $workerRoot 'worker-manager.stderr.log'
+                $reviewDownloadItems | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jobFile -Encoding UTF8
 
-                $reviewStage = Join-Path $workerRoot ('review-' + [Guid]::NewGuid().ToString('N'))
-                New-Item -ItemType Directory -Path $reviewStage | Out-Null
-                $download = Invoke-DownloadAttempt -Item $item -Mode $Mode -StageFolder $reviewStage -BypassGuard
-                if (-not $download.Success) {
-                    Add-LogRecord -Section 'Failed After All Attempts' -Message ($item.title + ' (id: ' + $item.id + ')')
-                } elseif ($download.UsedFallback) {
-                    Add-LogRecord -Section 'Kept After Review' -Message ($item.title + ' -> ' + $download.AttemptLabel)
-                }
+                $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $TargetFolder -WorkerLogFile $workerLog -OutputLogFile $stdoutLog -ErrorLogFile $stderrLog -RunKind Update -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel 'Worker Manager'
+                $managerInfo = New-WorkerRunInfo -Process $process -LogFile $workerLog -Label 'Worker Manager' -StdOutPath $stdoutLog -StdErrPath $stderrLog -TotalItems $reviewDownloadItems.Count
+                $workerInfos.Add($managerInfo) | Out-Null
+                Wait-WorkerProcesses -WorkerInfos @($managerInfo)
             }
         }
     }
@@ -3310,6 +3342,9 @@ if (-not $NoRun) {
             $message = $_ | Out-String
         }
         Write-Host ("ERROR: {0}" -f $message) -ForegroundColor Red
+        if (-not [string]::IsNullOrWhiteSpace($_.ScriptStackTrace)) {
+            Write-Host $_.ScriptStackTrace -ForegroundColor DarkRed
+        }
         if (-not $Worker) {
             [void](Read-TrimmedInput -Prompt 'Press Enter to close')
         }
