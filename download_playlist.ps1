@@ -670,6 +670,61 @@ function Get-PlaylistDownloadBuckets {
     }
 }
 
+function Get-WorkerFilteredReviewItems {
+    param(
+        [Parameter(Mandatory = $true)][string[]] $LogFiles,
+        [Parameter(Mandatory = $true)] [object[]] $CandidateItems
+    )
+
+    if ($LogFiles.Count -eq 0 -or $CandidateItems.Count -eq 0) {
+        return @()
+    }
+
+    $itemsById = @{}
+    foreach ($item in $CandidateItems) {
+        $itemId = [string]$item.id
+        if ([string]::IsNullOrWhiteSpace($itemId)) {
+            continue
+        }
+        if (-not $itemsById.ContainsKey($itemId)) {
+            $itemsById[$itemId] = $item
+        }
+    }
+
+    $selectedIds = New-Object System.Collections.Generic.HashSet[string]
+    $selectedItems = New-Object System.Collections.Generic.List[object]
+    foreach ($path in $LogFiles) {
+        if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
+            continue
+        }
+
+        try {
+            $records = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        } catch {
+            continue
+        }
+
+        foreach ($record in @($records)) {
+            if ($null -eq $record -or [string]$record.Section -ne 'Skipped By Filter') {
+                continue
+            }
+
+            $itemId = [string]$record.ItemId
+            if ([string]::IsNullOrWhiteSpace($itemId)) {
+                continue
+            }
+            if (-not $itemsById.ContainsKey($itemId)) {
+                continue
+            }
+            if ($selectedIds.Add($itemId)) {
+                $selectedItems.Add($itemsById[$itemId]) | Out-Null
+            }
+        }
+    }
+
+    return @($selectedItems)
+}
+
 function Get-ManualReviewDisplayInfo {
     param([Parameter(Mandatory = $true)] $Item)
 
@@ -1334,46 +1389,201 @@ function Read-AppendedLogChunk {
     }
 }
 
-function Write-WorkerLogDelta {
+function Get-WorkerOverallPercent {
+    param([Parameter(Mandatory = $true)] $WorkerInfo)
+
+    $total = [int]$WorkerInfo.TotalItems
+    if ($total -le 0) {
+        return 100.0
+    }
+
+    $completed = [double][Math]::Min([int]$WorkerInfo.CompletedItems, $total)
+    $trackFraction = 0.0
+    if ($WorkerInfo.ActiveItem) {
+        $trackFraction = [Math]::Min([Math]::Max([double]$WorkerInfo.TrackPercent, 0.0), 99.9) / 100.0
+    }
+
+    return [Math]::Min((($completed + $trackFraction) / $total) * 100.0, 100.0)
+}
+
+function Get-ShortDisplayText {
     param(
-        [Parameter(Mandatory = $true)] $WorkerInfo,
-        [Parameter(Mandatory = $true)][ValidateSet('StdOut', 'StdErr')] [string] $StreamName,
-        [switch] $FlushPartial
+        [string] $Text,
+        [int] $MaxLength = 56
     )
 
-    $pathProperty = $StreamName + 'Path'
-    $offsetProperty = $StreamName + 'Offset'
-    $bufferProperty = $StreamName + 'Buffer'
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ''
+    }
 
-    $read = Read-AppendedLogChunk -Path $WorkerInfo.$pathProperty -Offset ([long]$WorkerInfo.$offsetProperty)
-    $WorkerInfo.$offsetProperty = $read.NextOffset
+    $value = $Text.Trim()
+    if ($value.Length -le $MaxLength) {
+        return $value
+    }
 
-    $text = [string]$WorkerInfo.$bufferProperty + [string]$read.Text
-    if ([string]::IsNullOrEmpty($text)) {
+    if ($MaxLength -le 3) {
+        return $value.Substring(0, $MaxLength)
+    }
+
+    return ($value.Substring(0, $MaxLength - 3) + '...')
+}
+
+function Update-WorkerDashboardState {
+    param(
+        [Parameter(Mandatory = $true)] $WorkerInfo,
+        [Parameter(Mandatory = $true)][string] $Line
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
         return
     }
 
-    $parts = $text -split "`r?`n", 0
-    $lineCount = $parts.Count
-    $hasTrailingNewline = $text.EndsWith("`n")
-    if (-not $hasTrailingNewline) {
-        $WorkerInfo.$bufferProperty = $parts[$lineCount - 1]
-        $lineCount--
-    } else {
-        $WorkerInfo.$bufferProperty = ''
+    $text = $Line.Trim()
+
+    if ($text -match '^\[(Create|Update)\] Downloading:\s+(.+)$') {
+        $WorkerInfo.State = 'Downloading'
+        $WorkerInfo.CurrentSong = [string]$matches[2]
+        $WorkerInfo.TrackPercent = 0.0
+        $WorkerInfo.Speed = '--'
+        $WorkerInfo.ActiveItem = $true
+        return
     }
 
-    for ($i = 0; $i -lt $lineCount; $i++) {
-        $line = $parts[$i]
-        if ([string]::IsNullOrWhiteSpace($line)) {
-            continue
+    if ($text -match '^\[(Create|Update)\] Finished(?: via fallback)?:\s+(.+)$') {
+        $WorkerInfo.CompletedItems = [Math]::Min(([int]$WorkerInfo.CompletedItems + 1), [int]$WorkerInfo.TotalItems)
+        $WorkerInfo.State = 'Done'
+        $WorkerInfo.CurrentSong = [string]$matches[2]
+        $WorkerInfo.TrackPercent = 100.0
+        $WorkerInfo.Speed = '--'
+        $WorkerInfo.ActiveItem = $false
+        return
+    }
+
+    if ($text -match '^\[(Create|Update)\] Failed:\s+(.+)$') {
+        $WorkerInfo.CompletedItems = [Math]::Min(([int]$WorkerInfo.CompletedItems + 1), [int]$WorkerInfo.TotalItems)
+        $WorkerInfo.State = 'Failed'
+        $WorkerInfo.CurrentSong = [string]$matches[2]
+        $WorkerInfo.TrackPercent = 0.0
+        $WorkerInfo.Speed = '--'
+        $WorkerInfo.ActiveItem = $false
+        return
+    }
+
+    if ($text -match '^\[(Create|Update)\] Skipped by filter:\s+(.+)$') {
+        $WorkerInfo.CompletedItems = [Math]::Min(([int]$WorkerInfo.CompletedItems + 1), [int]$WorkerInfo.TotalItems)
+        $WorkerInfo.State = 'Skipped'
+        $WorkerInfo.CurrentSong = [string]$matches[2]
+        $WorkerInfo.TrackPercent = 0.0
+        $WorkerInfo.Speed = '--'
+        $WorkerInfo.ActiveItem = $false
+        return
+    }
+
+    if ($text -match '^\[download\]\s+([0-9.]+)% of .* at\s+(.+?) ETA ') {
+        $WorkerInfo.State = 'Downloading'
+        $WorkerInfo.TrackPercent = [double]$matches[1]
+        $WorkerInfo.Speed = [string]$matches[2].Trim()
+        return
+    }
+
+    if ($text -match '^\[postprocess\]') {
+        $WorkerInfo.State = 'Postprocess'
+        $WorkerInfo.TrackPercent = 100.0
+        $WorkerInfo.Speed = '--'
+        return
+    }
+
+    if ($text -match '^ERROR:\s+(.+)$') {
+        $WorkerInfo.State = 'Error'
+        $WorkerInfo.Speed = '--'
+        $WorkerInfo.LastMessage = [string]$matches[1]
+        return
+    }
+}
+
+function Get-WorkerDashboardLine {
+    param(
+        [Parameter(Mandatory = $true)] $WorkerInfo,
+        [int] $Width = 120
+    )
+
+    $overall = Get-WorkerOverallPercent -WorkerInfo $WorkerInfo
+    $song = Get-ShortDisplayText -Text $WorkerInfo.CurrentSong -MaxLength 52
+    if ([string]::IsNullOrWhiteSpace($song)) {
+        $song = 'waiting'
+    }
+
+    $speed = [string]$WorkerInfo.Speed
+    if ([string]::IsNullOrWhiteSpace($speed)) {
+        $speed = '--'
+    }
+
+    $trackPercentText = '--'
+    if ($WorkerInfo.ActiveItem -or $WorkerInfo.TrackPercent -gt 0) {
+        $trackPercentText = ('{0,5:0.#}%' -f [double]$WorkerInfo.TrackPercent)
+    }
+
+    $status = [string]$WorkerInfo.State
+    if ([string]::IsNullOrWhiteSpace($status)) {
+        $status = 'Waiting'
+    }
+    if ($status -eq 'Error' -and -not [string]::IsNullOrWhiteSpace([string]$WorkerInfo.LastMessage)) {
+        $song = Get-ShortDisplayText -Text $WorkerInfo.LastMessage -MaxLength 52
+    }
+
+    $line = "{0,-10} {1,5:0.#}% overall | {2,7} track | {3,10} | {4,-11} | {5}" -f $WorkerInfo.Label, $overall, $trackPercentText, $speed, $status, $song
+    if ($line.Length -gt $Width) {
+        return $line.Substring(0, $Width)
+    }
+
+    return $line.PadRight($Width)
+}
+
+function New-WorkerDashboard {
+    param([Parameter(Mandatory = $true)][object[]] $WorkerInfos)
+
+    $enabled = $false
+    $originTop = 0
+    $width = 120
+
+    try {
+        $enabled = -not [Console]::IsOutputRedirected
+        if ($enabled) {
+            $originTop = [Console]::CursorTop
+            $width = [Math]::Max([Console]::WindowWidth - 1, 80)
+            foreach ($nullValue in $WorkerInfos) {
+                [Console]::Out.WriteLine(''.PadRight($width))
+            }
+            [Console]::SetCursorPosition(0, $originTop)
         }
-        Write-Host ("[{0}] {1}" -f $WorkerInfo.Label, $line)
+    } catch {
+        $enabled = $false
     }
 
-    if ($FlushPartial -and -not [string]::IsNullOrWhiteSpace([string]$WorkerInfo.$bufferProperty)) {
-        Write-Host ("[{0}] {1}" -f $WorkerInfo.Label, $WorkerInfo.$bufferProperty)
-        $WorkerInfo.$bufferProperty = ''
+    return [pscustomobject]@{
+        Enabled   = $enabled
+        OriginTop = $originTop
+        Width     = $width
+    }
+}
+
+function Render-WorkerDashboard {
+    param(
+        [Parameter(Mandatory = $true)] $Dashboard,
+        [Parameter(Mandatory = $true)][object[]] $WorkerInfos
+    )
+
+    if (-not $Dashboard.Enabled) {
+        return
+    }
+
+    try {
+        for ($i = 0; $i -lt $WorkerInfos.Count; $i++) {
+            [Console]::SetCursorPosition(0, $Dashboard.OriginTop + $i)
+            [Console]::Out.Write((Get-WorkerDashboardLine -WorkerInfo $WorkerInfos[$i] -Width $Dashboard.Width))
+        }
+        [Console]::SetCursorPosition(0, $Dashboard.OriginTop + $WorkerInfos.Count)
+    } catch {
     }
 }
 
@@ -1384,13 +1594,45 @@ function Wait-WorkerProcesses {
         return
     }
 
+    $dashboard = New-WorkerDashboard -WorkerInfos $WorkerInfos
+    Render-WorkerDashboard -Dashboard $dashboard -WorkerInfos $WorkerInfos
+
     $pending = @($WorkerInfos)
     while ($pending.Count -gt 0) {
         foreach ($info in $pending) {
-            Write-WorkerLogDelta -WorkerInfo $info -StreamName StdOut
-            Write-WorkerLogDelta -WorkerInfo $info -StreamName StdErr
+            foreach ($streamName in @('StdOut', 'StdErr')) {
+                $pathProperty = $streamName + 'Path'
+                $offsetProperty = $streamName + 'Offset'
+                $bufferProperty = $streamName + 'Buffer'
+
+                $read = Read-AppendedLogChunk -Path $info.$pathProperty -Offset ([long]$info.$offsetProperty)
+                $info.$offsetProperty = $read.NextOffset
+
+                $text = [string]$info.$bufferProperty + [string]$read.Text
+                if ([string]::IsNullOrEmpty($text)) {
+                    continue
+                }
+
+                $parts = $text -split "`r?`n", 0
+                $lineCount = $parts.Count
+                if (-not $text.EndsWith("`n")) {
+                    $info.$bufferProperty = $parts[$lineCount - 1]
+                    $lineCount--
+                } else {
+                    $info.$bufferProperty = ''
+                }
+
+                for ($i = 0; $i -lt $lineCount; $i++) {
+                    $line = $parts[$i]
+                    if ([string]::IsNullOrWhiteSpace($line)) {
+                        continue
+                    }
+                    Update-WorkerDashboardState -WorkerInfo $info -Line $line
+                }
+            }
         }
 
+        Render-WorkerDashboard -Dashboard $dashboard -WorkerInfos $WorkerInfos
         Start-Sleep -Milliseconds 200
         $pending = @(
             $pending | Where-Object {
@@ -1404,9 +1646,16 @@ function Wait-WorkerProcesses {
     }
 
     foreach ($info in $WorkerInfos) {
-        Write-WorkerLogDelta -WorkerInfo $info -StreamName StdOut -FlushPartial
-        Write-WorkerLogDelta -WorkerInfo $info -StreamName StdErr -FlushPartial
+        foreach ($streamName in @('StdOut', 'StdErr')) {
+            $bufferProperty = $streamName + 'Buffer'
+            if (-not [string]::IsNullOrWhiteSpace([string]$info.$bufferProperty)) {
+                Update-WorkerDashboardState -WorkerInfo $info -Line ([string]$info.$bufferProperty)
+                $info.$bufferProperty = ''
+            }
+        }
     }
+
+    Render-WorkerDashboard -Dashboard $dashboard -WorkerInfos $WorkerInfos
 }
 
 function Select-UpdateTargetFolder {
@@ -2363,6 +2612,7 @@ function Invoke-WorkerMode {
                 Write-Output ("[{0}] Skipped by filter: {1}" -f $RunKind, $displayLabel)
                 $workerRecords.Add([pscustomobject]@{
                     Section = 'Skipped By Filter'
+                    ItemId  = [string]$item.id
                     Message = ($item.title + ' - direct YouTube Music download was not music-like')
                 }) | Out-Null
                 continue
@@ -2491,6 +2741,14 @@ function Invoke-CreatePlaylist {
                 Process      = $process
                 LogFile      = $workerLog
                 Label        = $workerLabel
+                TotalItems   = $slice.Count
+                CompletedItems = 0
+                CurrentSong  = ''
+                TrackPercent = 0.0
+                Speed        = '--'
+                State        = 'Waiting'
+                ActiveItem   = $false
+                LastMessage  = ''
                 StdOutPath   = $stdoutLog
                 StdErrPath   = $stderrLog
                 StdOutOffset = 0L
@@ -2501,6 +2759,24 @@ function Invoke-CreatePlaylist {
         }
 
         Wait-WorkerProcesses -WorkerInfos $workerInfos.ToArray()
+    }
+
+    $workerReviewItems = @(Get-WorkerFilteredReviewItems -LogFiles @($workerInfos | ForEach-Object { $_.LogFile }) -CandidateItems $downloadItems)
+    if ($workerReviewItems.Count -gt 0) {
+        $reviewIds = New-Object System.Collections.Generic.HashSet[string]
+        foreach ($item in $reviewItems) {
+            $itemId = [string]$item.id
+            if (-not [string]::IsNullOrWhiteSpace($itemId)) {
+                $reviewIds.Add($itemId) | Out-Null
+            }
+        }
+
+        foreach ($item in $workerReviewItems) {
+            $itemId = [string]$item.id
+            if ([string]::IsNullOrWhiteSpace($itemId) -or $reviewIds.Add($itemId)) {
+                $reviewItems += $item
+            }
+        }
     }
 
     $selectedReviewIds = New-Object System.Collections.Generic.HashSet[string]
@@ -2729,6 +3005,14 @@ function Invoke-UpdatePlaylist {
                 Process      = $process
                 LogFile      = $workerLog
                 Label        = $workerLabel
+                TotalItems   = $slice.Count
+                CompletedItems = 0
+                CurrentSong  = ''
+                TrackPercent = 0.0
+                Speed        = '--'
+                State        = 'Waiting'
+                ActiveItem   = $false
+                LastMessage  = ''
                 StdOutPath   = $stdoutLog
                 StdErrPath   = $stderrLog
                 StdOutOffset = 0L
@@ -2739,6 +3023,24 @@ function Invoke-UpdatePlaylist {
         }
 
         Wait-WorkerProcesses -WorkerInfos $workerInfos.ToArray()
+    }
+
+    $workerReviewItems = @(Get-WorkerFilteredReviewItems -LogFiles @($workerInfos | ForEach-Object { $_.LogFile }) -CandidateItems @($missing))
+    if ($workerReviewItems.Count -gt 0) {
+        $reviewIds = New-Object System.Collections.Generic.HashSet[string]
+        foreach ($item in $reviewItems) {
+            $itemId = [string]$item.id
+            if (-not [string]::IsNullOrWhiteSpace($itemId)) {
+                $reviewIds.Add($itemId) | Out-Null
+            }
+        }
+
+        foreach ($item in $workerReviewItems) {
+            $itemId = [string]$item.id
+            if ([string]::IsNullOrWhiteSpace($itemId) -or $reviewIds.Add($itemId)) {
+                $reviewItems.Add($item) | Out-Null
+            }
+        }
     }
 
     $selectedReviewIds = New-Object System.Collections.Generic.HashSet[string]
