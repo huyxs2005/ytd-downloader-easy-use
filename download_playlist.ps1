@@ -140,6 +140,7 @@ function Invoke-YtDlp {
         [Parameter(Mandatory = $true)]
         [string[]] $Arguments,
         [switch] $CaptureOutput,
+        [ref] $Result,
         [int] $TimeoutSeconds = 600
     )
 
@@ -152,25 +153,38 @@ function Invoke-YtDlp {
     $full = @($common + $Arguments)
     if ($CaptureOutput) {
         $output = @(& $yt @full 2>&1)
-        return [pscustomobject]@{
+        $captured = [pscustomobject]@{
             ExitCode  = $LASTEXITCODE
             Output    = @($output | ForEach-Object { [string]$_ })
             TimedOut  = $false
         }
+        if ($PSBoundParameters.ContainsKey('Result')) {
+            $Result.Value = $captured
+            return
+        }
+        return $captured
     }
 
-    & $yt @full
-    return [pscustomobject]@{
+    & $yt @full | ForEach-Object {
+        [Console]::Out.WriteLine([string]$_)
+    }
+    $live = [pscustomobject]@{
         ExitCode = $LASTEXITCODE
         Output   = @()
         TimedOut = $false
     }
+    if ($PSBoundParameters.ContainsKey('Result')) {
+        $Result.Value = $live
+        return
+    }
+    return $live
 }
 
 function Get-FlatEntries {
     param([Parameter(Mandatory = $true)][string] $Url)
 
-    $result = Invoke-YtDlp -Arguments @(
+    $result = $null
+    Invoke-YtDlp -Arguments @(
         '--quiet',
         '--no-warnings',
         '--ignore-errors',
@@ -178,7 +192,7 @@ function Get-FlatEntries {
         '--dump-json',
         '--no-download',
         $Url
-    ) -CaptureOutput
+    ) -CaptureOutput -Result ([ref]$result)
 
     $entries = New-Object System.Collections.Generic.List[object]
     foreach ($line in $result.Output) {
@@ -198,7 +212,8 @@ function Get-FlatEntries {
 function Get-VideoDetails {
     param([Parameter(Mandatory = $true)][string] $Url)
 
-    $result = Invoke-YtDlp -Arguments @(
+    $result = $null
+    Invoke-YtDlp -Arguments @(
         '--quiet',
         '--no-warnings',
         '--ignore-errors',
@@ -206,7 +221,7 @@ function Get-VideoDetails {
         '--dump-single-json',
         '--no-playlist',
         $Url
-    ) -CaptureOutput
+    ) -CaptureOutput -Result ([ref]$result)
 
     $json = ($result.Output -join "`n").Trim()
     if ([string]::IsNullOrWhiteSpace($json)) {
@@ -1191,6 +1206,32 @@ function Get-WorkerWindowBounds {
     }
 }
 
+function ConvertTo-ProcessArgumentString {
+    param([Parameter(Mandatory = $true)][string[]] $Arguments)
+
+    $quoted = foreach ($argument in $Arguments) {
+        if ($null -eq $argument) {
+            '""'
+            continue
+        }
+
+        $text = [string]$argument
+        if ($text.Length -eq 0) {
+            '""'
+            continue
+        }
+
+        if ($text -notmatch '[\s"]') {
+            $text
+            continue
+        }
+
+        '"' + ($text -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+    }
+
+    return ($quoted -join ' ')
+}
+
 function Set-ProcessWindowBounds {
     param(
         [Parameter(Mandatory = $true)] $Process,
@@ -1241,16 +1282,140 @@ public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
     }
 }
 
+function Read-AppendedLogChunk {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][long] $Offset
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{
+            Text       = ''
+            NextOffset = $Offset
+        }
+    }
+
+    try {
+        $fileInfo = Get-Item -LiteralPath $Path -ErrorAction Stop
+    } catch {
+        return [pscustomobject]@{
+            Text       = ''
+            NextOffset = $Offset
+        }
+    }
+
+    if ($fileInfo.Length -lt $Offset) {
+        $Offset = 0
+    }
+    if ($fileInfo.Length -eq $Offset) {
+        return [pscustomobject]@{
+            Text       = ''
+            NextOffset = $Offset
+        }
+    }
+
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $stream.Seek($Offset, [System.IO.SeekOrigin]::Begin) | Out-Null
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true)
+        $text = $reader.ReadToEnd()
+        return [pscustomobject]@{
+            Text       = $text
+            NextOffset = $stream.Position
+        }
+    } finally {
+        if ($reader) {
+            $reader.Dispose()
+        } elseif ($stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Write-WorkerLogDelta {
+    param(
+        [Parameter(Mandatory = $true)] $WorkerInfo,
+        [Parameter(Mandatory = $true)][ValidateSet('StdOut', 'StdErr')] [string] $StreamName,
+        [switch] $FlushPartial
+    )
+
+    $pathProperty = $StreamName + 'Path'
+    $offsetProperty = $StreamName + 'Offset'
+    $bufferProperty = $StreamName + 'Buffer'
+
+    $read = Read-AppendedLogChunk -Path $WorkerInfo.$pathProperty -Offset ([long]$WorkerInfo.$offsetProperty)
+    $WorkerInfo.$offsetProperty = $read.NextOffset
+
+    $text = [string]$WorkerInfo.$bufferProperty + [string]$read.Text
+    if ([string]::IsNullOrEmpty($text)) {
+        return
+    }
+
+    $parts = $text -split "`r?`n", 0
+    $lineCount = $parts.Count
+    $hasTrailingNewline = $text.EndsWith("`n")
+    if (-not $hasTrailingNewline) {
+        $WorkerInfo.$bufferProperty = $parts[$lineCount - 1]
+        $lineCount--
+    } else {
+        $WorkerInfo.$bufferProperty = ''
+    }
+
+    for ($i = 0; $i -lt $lineCount; $i++) {
+        $line = $parts[$i]
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        Write-Host ("[{0}] {1}" -f $WorkerInfo.Label, $line)
+    }
+
+    if ($FlushPartial -and -not [string]::IsNullOrWhiteSpace([string]$WorkerInfo.$bufferProperty)) {
+        Write-Host ("[{0}] {1}" -f $WorkerInfo.Label, $WorkerInfo.$bufferProperty)
+        $WorkerInfo.$bufferProperty = ''
+    }
+}
+
+function Wait-WorkerProcesses {
+    param([Parameter(Mandatory = $true)][object[]] $WorkerInfos)
+
+    if ($null -eq $WorkerInfos -or $WorkerInfos.Count -eq 0) {
+        return
+    }
+
+    $pending = @($WorkerInfos)
+    while ($pending.Count -gt 0) {
+        foreach ($info in $pending) {
+            Write-WorkerLogDelta -WorkerInfo $info -StreamName StdOut
+            Write-WorkerLogDelta -WorkerInfo $info -StreamName StdErr
+        }
+
+        Start-Sleep -Milliseconds 200
+        $pending = @(
+            $pending | Where-Object {
+                try {
+                    -not $_.Process.HasExited
+                } catch {
+                    $false
+                }
+            }
+        )
+    }
+
+    foreach ($info in $WorkerInfos) {
+        Write-WorkerLogDelta -WorkerInfo $info -StreamName StdOut -FlushPartial
+        Write-WorkerLogDelta -WorkerInfo $info -StreamName StdErr -FlushPartial
+    }
+}
+
 function Select-UpdateTargetFolder {
     param([Parameter(Mandatory = $true)][string] $DownloadRoot)
 
     Write-Host '1. Pick from downloaded folders'
     Write-Host '2. Pick a custom folder'
 
-    $choice = ''
-    while ($choice -notin @('1', '2')) {
-        $choice = (Read-Host 'Select target folder source').Trim()
-    }
+    $choice = Read-ChoiceInput -Prompt 'Select target folder source' -AllowedValues @('1', '2') -InvalidMessage 'Choose 1 or 2.'
 
     if ($choice -eq '1') {
         $folders = Get-ChildItem -LiteralPath $DownloadRoot -Directory -ErrorAction SilentlyContinue |
@@ -1267,7 +1432,11 @@ function Select-UpdateTargetFolder {
 
         $selection = 0
         while ($selection -lt 1 -or $selection -gt $folders.Count) {
-            [void][int]::TryParse((Read-Host 'Pick target folder'), [ref]$selection)
+            $selectionText = Read-RequiredInput -Prompt 'Pick target folder' -InvalidMessage 'Enter a folder number.'
+            if (-not [int]::TryParse($selectionText, [ref]$selection) -or $selection -lt 1 -or $selection -gt $folders.Count) {
+                Write-Host ("Choose a number from 1 to {0}." -f $folders.Count)
+                $selection = 0
+            }
         }
 
         return [pscustomobject]@{
@@ -1280,7 +1449,7 @@ function Select-UpdateTargetFolder {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
     } catch {
         Write-Host 'Windows folder picker is unavailable. Enter a folder path instead.'
-        $manualPath = (Read-Host 'Enter folder path').Trim()
+        $manualPath = Read-TrimmedInput -Prompt 'Enter folder path'
         if ([string]::IsNullOrWhiteSpace($manualPath) -or -not (Test-Path -LiteralPath $manualPath)) {
             return $null
         }
@@ -1430,14 +1599,15 @@ function Get-SearchUrlsFromYouTube {
         [string] $UploaderHint
     )
 
-    $result = Invoke-YtDlp -Arguments @(
+    $result = $null
+    Invoke-YtDlp -Arguments @(
         '--quiet',
         '--no-warnings',
         '--flat-playlist',
         '--skip-download',
         '--print', "%(id)s`t%(title)s`t%(uploader)s",
         ('ytsearch25:' + $Query)
-    ) -CaptureOutput
+    ) -CaptureOutput -Result ([ref]$result)
 
     if ($result.ExitCode -ne 0) {
         return @()
@@ -1821,6 +1991,7 @@ function Invoke-DownloadAttempt {
             $downloadArgs = @(
                 '--newline',
                 '--progress',
+                '--no-warnings',
                 '--console-title',
                 '--progress-template', 'download:[download] %(progress._percent_str)s of %(progress._downloaded_bytes_str)s / %(progress._total_bytes_str)s at %(progress._speed_str)s ETA %(progress._eta_str)s',
                 '--progress-template', 'postprocess:[postprocess] %(progress.postprocessor)s %(progress._percent_str)s',
@@ -1833,8 +2004,9 @@ function Invoke-DownloadAttempt {
             $downloadArgs += $formatArgs
             $downloadArgs += $resolvedUrl
             try {
-                Write-Host ("Attempt {0}/{1}: {2}" -f ($i + 1), $attempts.Count, $attempt.Label)
-                $result = Invoke-YtDlp -Arguments $downloadArgs
+                Write-Output ("Attempt {0}/{1}: {2}" -f ($i + 1), $attempts.Count, $attempt.Label)
+                $result = $null
+                Invoke-YtDlp -Arguments $downloadArgs -Result ([ref]$result)
             } catch {
                 if (Test-Path -LiteralPath $attemptStage) {
                     Remove-Item -LiteralPath $attemptStage -Recurse -Force -ErrorAction SilentlyContinue
@@ -2046,6 +2218,8 @@ function Start-WorkerProcess {
         [Parameter(Mandatory = $true)][string] $TempRoot,
         [Parameter(Mandatory = $true)][string] $TargetFolder,
         [Parameter(Mandatory = $true)][string] $WorkerLogFile,
+        [Parameter(Mandatory = $true)][string] $OutputLogFile,
+        [Parameter(Mandatory = $true)][string] $ErrorLogFile,
         [Parameter(Mandatory = $true)][ValidateSet('Create', 'Update')] [string] $RunKind,
         [Parameter(Mandatory = $true)][ValidateSet('Audio', 'Video')] [string] $Mode,
         [Parameter(Mandatory = $true)][string] $SourceLabel,
@@ -2068,10 +2242,21 @@ function Start-WorkerProcess {
         '-WorkerLabel', $WorkerLabel
     )
 
-    $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -WorkingDirectory $PSScriptRoot -PassThru -WindowStyle Normal
-    if ($WorkerSlot -gt 0) {
-        Set-ProcessWindowBounds -Process $process -WorkerSlot $WorkerSlot
+    foreach ($path in @($OutputLogFile, $ErrorLogFile)) {
+        $parent = Split-Path -Parent $path
+        if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        }
+        Set-Content -LiteralPath $path -Value '' -Encoding UTF8
     }
+
+    $process = Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList (ConvertTo-ProcessArgumentString -Arguments $arguments) `
+        -WorkingDirectory $PSScriptRoot `
+        -PassThru `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $OutputLogFile `
+        -RedirectStandardError $ErrorLogFile
 
     return $process
 }
@@ -2103,6 +2288,10 @@ function Wait-WorkerProcess {
         return
     }
 
+    if ($Process.PSObject.Properties.Match('Process').Count -gt 0) {
+        $Process = $Process.Process
+    }
+
     try {
         $null = $Process.WaitForExit()
     } catch {
@@ -2125,7 +2314,7 @@ function Invoke-WorkerMode {
         $windowTitle = $windowTitle + ' | ' + ($details -join ' | ')
     }
     Set-ProcessTitle -Title $windowTitle
-    Write-Host ("[{0}] {1}" -f $RunKind, $SourceLabel)
+    Write-Output ("[{0}] {1}" -f $RunKind, $SourceLabel)
 
     if (-not (Test-Path -LiteralPath $JobFile)) {
         throw "Worker job file not found: $JobFile"
@@ -2155,23 +2344,23 @@ function Invoke-WorkerMode {
         try {
             $displayLabel = Get-ItemDisplayLabel -Item $item
             Set-ProcessTitle -Title ("{0} | {1}" -f $windowTitle, $displayLabel)
-            Write-Host ("[{0}] Downloading: {1}" -f $RunKind, $displayLabel)
+            Write-Output ("[{0}] Downloading: {1}" -f $RunKind, $displayLabel)
             $download = Invoke-DownloadAttempt -Item $item -Mode $Mode -StageFolder $workerStage
             if ($download.Success) {
                 if ($download.UsedFallback) {
-                    Write-Host ("[{0}] Finished via fallback: {1}" -f $RunKind, $displayLabel)
+                    Write-Output ("[{0}] Finished via fallback: {1}" -f $RunKind, $displayLabel)
                     $workerRecords.Add([pscustomobject]@{
                         Section = 'Fallback Success'
                         Message = ("{0} -> {1}" -f $item.title, $download.AttemptLabel)
                     }) | Out-Null
                 } else {
-                    Write-Host ("[{0}] Finished: {1}" -f $RunKind, $displayLabel)
+                    Write-Output ("[{0}] Finished: {1}" -f $RunKind, $displayLabel)
                 }
                 continue
             }
 
             if ($download.FilteredOut) {
-                Write-Host ("[{0}] Skipped by filter: {1}" -f $RunKind, $displayLabel)
+                Write-Output ("[{0}] Skipped by filter: {1}" -f $RunKind, $displayLabel)
                 $workerRecords.Add([pscustomobject]@{
                     Section = 'Skipped By Filter'
                     Message = ($item.title + ' - direct YouTube Music download was not music-like')
@@ -2179,14 +2368,14 @@ function Invoke-WorkerMode {
                 continue
             }
 
-            Write-Host ("[{0}] Failed: {1}" -f $RunKind, $displayLabel)
+            Write-Output ("[{0}] Failed: {1}" -f $RunKind, $displayLabel)
             $workerRecords.Add([pscustomobject]@{
                 Section = 'Failed After All Attempts'
                 Message = ($item.title + ' (id: ' + $item.id + ')')
             }) | Out-Null
         } catch {
             $displayLabel = Get-ItemDisplayLabel -Item $item
-            Write-Host ("[{0}] Failed: {1}" -f $RunKind, $displayLabel)
+            Write-Output ("[{0}] Failed: {1}" -f $RunKind, $displayLabel)
             $workerRecords.Add([pscustomobject]@{
                 Section = 'Failed After All Attempts'
                 Message = ($item.title + ' (id: ' + $item.id + ') - ' + $_.Exception.Message)
@@ -2292,19 +2481,26 @@ function Invoke-CreatePlaylist {
 
             $jobFile = Join-Path $workerRoot ("worker-{0}.json" -f ($workerIndex + 1))
             $workerLog = Join-Path $workerRoot ("worker-{0}.log.json" -f ($workerIndex + 1))
+            $stdoutLog = Join-Path $workerRoot ("worker-{0}.stdout.log" -f ($workerIndex + 1))
+            $stderrLog = Join-Path $workerRoot ("worker-{0}.stderr.log" -f ($workerIndex + 1))
             $slice | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jobFile -Encoding UTF8
 
             $workerLabel = 'Worker {0}/4' -f ($workerIndex + 1)
-            $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $PlaylistFolder -WorkerLogFile $workerLog -RunKind Create -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel $workerLabel -WorkerSlot ($workerIndex + 1)
+            $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $PlaylistFolder -WorkerLogFile $workerLog -OutputLogFile $stdoutLog -ErrorLogFile $stderrLog -RunKind Create -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel $workerLabel -WorkerSlot ($workerIndex + 1)
             $workerInfos.Add([pscustomobject]@{
-                Process = $process
-                LogFile = $workerLog
+                Process      = $process
+                LogFile      = $workerLog
+                Label        = $workerLabel
+                StdOutPath   = $stdoutLog
+                StdErrPath   = $stderrLog
+                StdOutOffset = 0L
+                StdErrOffset = 0L
+                StdOutBuffer = ''
+                StdErrBuffer = ''
             }) | Out-Null
         }
 
-        foreach ($info in $workerInfos) {
-            Wait-WorkerProcess -Process $info.Process
-        }
+        Wait-WorkerProcesses -WorkerInfos $workerInfos.ToArray()
     }
 
     $selectedReviewIds = New-Object System.Collections.Generic.HashSet[string]
@@ -2523,19 +2719,26 @@ function Invoke-UpdatePlaylist {
 
             $jobFile = Join-Path $workerRoot ("worker-{0}.json" -f ($workerIndex + 1))
             $workerLog = Join-Path $workerRoot ("worker-{0}.log.json" -f ($workerIndex + 1))
+            $stdoutLog = Join-Path $workerRoot ("worker-{0}.stdout.log" -f ($workerIndex + 1))
+            $stderrLog = Join-Path $workerRoot ("worker-{0}.stderr.log" -f ($workerIndex + 1))
             $slice | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jobFile -Encoding UTF8
 
             $workerLabel = 'Worker {0}/4' -f ($workerIndex + 1)
-            $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $TargetFolder -WorkerLogFile $workerLog -RunKind Update -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel $workerLabel -WorkerSlot ($workerIndex + 1)
+            $process = Start-WorkerProcess -JobFile $jobFile -TempRoot $workerRoot -TargetFolder $TargetFolder -WorkerLogFile $workerLog -OutputLogFile $stdoutLog -ErrorLogFile $stderrLog -RunKind Update -Mode $Mode -SourceLabel $labelForWorkers -WorkerLabel $workerLabel -WorkerSlot ($workerIndex + 1)
             $workerInfos.Add([pscustomobject]@{
-                Process = $process
-                LogFile = $workerLog
+                Process      = $process
+                LogFile      = $workerLog
+                Label        = $workerLabel
+                StdOutPath   = $stdoutLog
+                StdErrPath   = $stderrLog
+                StdOutOffset = 0L
+                StdErrOffset = 0L
+                StdOutBuffer = ''
+                StdErrBuffer = ''
             }) | Out-Null
         }
 
-        foreach ($info in $workerInfos) {
-            Wait-WorkerProcess -Process $info.Process
-        }
+        Wait-WorkerProcesses -WorkerInfos $workerInfos.ToArray()
     }
 
     $selectedReviewIds = New-Object System.Collections.Generic.HashSet[string]
@@ -2647,6 +2850,72 @@ function Get-RunLogPath {
     return (Join-Path $downloadRoot ("{0} {1}.log" -f $safeLabel, $dateStamp))
 }
 
+function Read-TrimmedInput {
+    param([Parameter(Mandatory = $true)][string] $Prompt)
+
+    try {
+        $value = Read-Host $Prompt
+    } catch {
+        return ''
+    }
+
+    if ($null -eq $value) {
+        return ''
+    }
+
+    return ([string]$value).Trim()
+}
+
+function Read-ChoiceInput {
+    param(
+        [Parameter(Mandatory = $true)][string] $Prompt,
+        [Parameter(Mandatory = $true)][string[]] $AllowedValues,
+        [string] $InvalidMessage = 'Invalid input. Try again.'
+    )
+
+    $choice = ''
+    while ($choice -notin $AllowedValues) {
+        $choice = Read-TrimmedInput -Prompt $Prompt
+        if ($choice -in $AllowedValues) {
+            return $choice
+        }
+        Write-Host $InvalidMessage
+    }
+
+    return $choice
+}
+
+function Read-RequiredInput {
+    param(
+        [Parameter(Mandatory = $true)][string] $Prompt,
+        [string] $InvalidMessage = 'Input is required. Try again.'
+    )
+
+    $value = ''
+    while ([string]::IsNullOrWhiteSpace($value)) {
+        $value = Read-TrimmedInput -Prompt $Prompt
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            return $value
+        }
+        Write-Host $InvalidMessage
+    }
+
+    return $value
+}
+
+function Read-UrlInput {
+    param([Parameter(Mandatory = $true)][string] $Prompt)
+
+    while ($true) {
+        $url = Read-RequiredInput -Prompt $Prompt -InvalidMessage 'URL is required. Try again.'
+        $parsedUri = $null
+        if ([Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$parsedUri) -and $parsedUri.Scheme -in @('http', 'https')) {
+            return $url
+        }
+        Write-Host 'Enter a valid http or https URL.'
+    }
+}
+
 function Invoke-InteractiveMode {
     Assert-Workspace
     Set-ProcessTitle -Title 'yt-dlp | waiting for input'
@@ -2654,22 +2923,13 @@ function Invoke-InteractiveMode {
 
     Write-Host '1. Create new'
     Write-Host '2. Update existing'
-    $choice = ''
-    while ($choice -notin @('1', '2')) {
-        $choice = (Read-Host 'Select action').Trim()
-    }
+    $choice = Read-ChoiceInput -Prompt 'Select action' -AllowedValues @('1', '2') -InvalidMessage 'Choose 1 or 2.'
 
-    $url = ''
-    while ([string]::IsNullOrWhiteSpace($url)) {
-        $url = (Read-Host 'Enter URL').Trim()
-    }
+    $url = Read-UrlInput -Prompt 'Enter URL'
 
     Write-Host '1. Audio only'
     Write-Host '2. Video only'
-    $modeChoice = ''
-    while ($modeChoice -notin @('1', '2')) {
-        $modeChoice = (Read-Host 'Select mode').Trim()
-    }
+    $modeChoice = Read-ChoiceInput -Prompt 'Select mode' -AllowedValues @('1', '2') -InvalidMessage 'Choose 1 or 2.'
     $selectedMode = if ($modeChoice -eq '1') { 'Audio' } else { 'Video' }
 
     $flatEntries = Get-FlatEntries -Url $url
@@ -2736,9 +2996,21 @@ function Invoke-InteractiveMode {
 }
 
 if (-not $NoRun) {
-    if ($Worker) {
-        Invoke-WorkerMode
-    } else {
-        Invoke-InteractiveMode
+    try {
+        if ($Worker) {
+            Invoke-WorkerMode
+        } else {
+            Invoke-InteractiveMode
+        }
+    } catch {
+        $message = $_.Exception.Message
+        if ([string]::IsNullOrWhiteSpace($message)) {
+            $message = $_ | Out-String
+        }
+        Write-Host ("ERROR: {0}" -f $message) -ForegroundColor Red
+        if (-not $Worker) {
+            [void](Read-TrimmedInput -Prompt 'Press Enter to close')
+        }
+        exit 1
     }
 }
