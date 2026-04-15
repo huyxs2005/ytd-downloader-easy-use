@@ -1,0 +1,14 @@
+All downloaded playlist/
+tmp_*/
+*.log
+*.tmp
+cookies.txt
+playlist.json
+yt-dlp.exe
+bin/
+*.opus
+*.webm
+*.mp4
+*.mkv
+*.info.json
+*.yt-dlp.id
